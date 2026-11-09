@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Birlikte dinle</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#2339d1;
+    --ink:#ffffff;
+    --soft:rgba(255,255,255,.78);
+    --disc:#f4eca8;
+    --disc-ink:#1a1f5c;
+  }
+  *{box-sizing:border-box}
+  html,body{min-height:100%;margin:0}
+  body{
+    background:var(--bg);color:var(--ink);
+    font-family:"Bricolage Grotesque",system-ui,-apple-system,"Segoe UI",sans-serif;
+    min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:1.75rem;padding:1.5rem;text-align:center;
+  }
+  h1{margin:0;font-size:clamp(1.4rem,4.5vw,2rem);font-weight:800;letter-spacing:-.01em}
+  #disc{
+    width:min(72vw,360px);aspect-ratio:1;border-radius:50%;border:0;
+    background:var(--disc);color:var(--disc-ink);
+    font:800 clamp(2.2rem,10vw,3.75rem)/1 "Bricolage Grotesque",system-ui,sans-serif;
+    cursor:pointer;display:grid;place-items:center;
+  }
+  #disc:disabled{cursor:default;opacity:1}
+  #disc:focus-visible,.host button:focus-visible,.host input:focus-visible{outline:4px solid #fff;outline-offset:4px}
+  #disc.live{box-shadow:0 0 0 14px rgba(244,236,168,.28),0 0 0 32px rgba(244,236,168,.12)}
+  @media (prefers-reduced-motion:no-preference){
+    #disc.live{animation:pulse 2.4s ease-in-out infinite}
+    @keyframes pulse{50%{box-shadow:0 0 0 22px rgba(244,236,168,.22),0 0 0 48px rgba(244,236,168,.07)}}
+  }
+  p{margin:0}
+  #info{font-size:1.1rem;color:var(--soft);max-width:34ch;min-height:2.8em}
+  #count{font-size:.95rem;color:var(--soft)}
+  .host{
+    display:none;width:min(92vw,380px);border:2px solid rgba(255,255,255,.5);border-radius:16px;
+    padding:1rem;gap:.75rem;flex-direction:column;text-align:left;
+  }
+  .host.show{display:flex}
+  .host label{font-size:.95rem;color:var(--soft)}
+  .host input{
+    font:inherit;padding:.65rem .8rem;border-radius:10px;border:2px solid transparent;
+    background:#fff;color:#1a1f5c;width:100%;
+  }
+  .row{display:flex;gap:.6rem}
+  .host button{
+    flex:1;font:800 1rem "Bricolage Grotesque",system-ui,sans-serif;padding:.7rem 1rem;border-radius:10px;
+    border:2px solid #fff;background:transparent;color:#fff;cursor:pointer;
+  }
+  .host button.main{background:#fff;color:#2339d1}
+  #hostmsg{font-size:.95rem;color:var(--soft);min-height:1.3em}
+</style>
+</head>
+<body>
+  <h1>Birlikte dinle</h1>
+  <button id="disc" type="button">Katıl</button>
+  <p id="info">Katıl’a bas. Host başlatınca ses herkeste aynı anda çalacak.</p>
+  <p id="count" aria-live="polite"></p>
+
+  <section class="host" id="host" aria-label="Host paneli">
+    <label for="pw">Host şifresi</label>
+    <input id="pw" type="password" autocomplete="current-password">
+    <div class="row">
+      <button class="main" id="btnPlay" type="button">Başlat</button>
+      <button id="btnStop" type="button">Durdur</button>
+    </div>
+    <p id="hostmsg" aria-live="polite"></p>
+  </section>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+// ====== AYARLAR ======
+const CONFIG = {
+  SUPABASE_URL: 'https://nptpxnqoinpojngopthd.supabase.co',
+  SUPABASE_ANON_KEY: 'sb_publishable_yUjlcqjQZvUio8u8i0bpMA_IA23KQmO',
+  AUDIO_URL: 'muzik.mp3'   // aynı klasördeki dosya ya da Supabase Storage'daki herkese açık link
+};
+// =====================
+
+const db = supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
+const $ = id => document.getElementById(id);
+const disc = $('disc'), info = $('info'), count = $('count');
+
+let ctx, buffer, offset = 0, src = null, scheduledStart = null, timer = null, joined = false;
+
+const serverNow = () => Date.now() + offset;
+const fmt = s => Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+
+// Sunucu saatiyle yerel saat arasındaki farkı ölç (en hızlı dönen örneği al)
+async function syncClock() {
+  let best = null;
+  for (let i = 0; i < 7; i++) {
+    const t0 = performance.now();
+    const { data, error } = await db.rpc('server_time');
+    const rtt = performance.now() - t0;
+    const local = Date.now();
+    if (error) continue;
+    if (!best || rtt < best.rtt) best = { rtt, off: Number(data) + rtt / 2 - local };
+  }
+  if (!best) throw new Error('clock');
+  offset = best.off;
+}
+
+async function loadAudio() {
+  const res = await fetch(CONFIG.AUDIO_URL);
+  if (!res.ok) throw new Error('audio');
+  buffer = await ctx.decodeAudioData(await res.arrayBuffer());
+}
+
+function stopAudio() {
+  const s = src; src = null;
+  if (s) { try { s.stop(); } catch (e) {} }
+}
+
+function setIdle(msg) {
+  clearInterval(timer);
+  disc.classList.remove('live');
+  disc.textContent = 'Hazır';
+  info.textContent = msg;
+}
+
+function play(when, from) {
+  const s = ctx.createBufferSource();
+  s.buffer = buffer;
+  s.connect(ctx.destination);
+  s.onended = () => {
+    if (src === s) { src = null; setIdle('Bitti. Host yeniden başlatırsa tekrar çalar.'); }
+  };
+  src = s;
+  s.start(when, from);
+}
+
+function runUI(start) {
+  clearInterval(timer);
+  timer = setInterval(() => {
+    const d = (start - serverNow()) / 1000;
+    if (d > 0) {
+      disc.classList.remove('live');
+      disc.textContent = Math.ceil(d);
+      info.textContent = 'Birazdan başlıyor.';
+    } else {
+      disc.classList.add('live');
+      disc.textContent = 'Çalıyor';
+      info.textContent = fmt(Math.min(-d, buffer.duration)) + ' / ' + fmt(buffer.duration);
+    }
+  }, 100);
+}
+
+// Odanın durumu değişince çağrılır (tekrar çağrılması zararsız)
+function apply(row) {
+  const start = row.status === 'playing' ? Number(row.start_at) : null;
+  if (start === scheduledStart) return;
+  stopAudio();
+  scheduledStart = start;
+  if (start === null) { setIdle('Host başlatınca ses herkeste aynı anda çalacak.'); return; }
+  const delta = (start - serverNow()) / 1000;
+  if (delta >= 0) {                       // henüz başlamadı: tam anına zamanla
+    play(ctx.currentTime + delta, 0);
+    runUI(start);
+  } else if (-delta < buffer.duration) {  // geç katıldın: doğru saniyeden devam et
+    play(0, -delta);
+    runUI(start);
+  } else {
+    setIdle('Bitti. Host yeniden başlatırsa tekrar çalar.');
+  }
+}
+
+async function fetchRow() {
+  const { data } = await db.from('room').select('*').eq('id', 1).single();
+  if (data) apply(data);
+}
+
+disc.addEventListener('click', async () => {
+  if (joined) return;
+  joined = true;
+  disc.disabled = true;
+  disc.textContent = '…';
+  info.textContent = 'Hazırlanıyor. Ses dosyası yükleniyor.';
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    await Promise.all([loadAudio(), syncClock()]);
+  } catch (e) {
+    joined = false;
+    disc.disabled = false;
+    disc.textContent = 'Katıl';
+    info.textContent = 'Bağlanılamadı. İnternetini kontrol edip tekrar bas.';
+    return;
+  }
+
+  const ch = db.channel('room-live', { config: { presence: { key: Math.random().toString(36).slice(2) } } });
+  ch.on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'room', filter: 'id=eq.1' },
+        p => apply(p.new))
+    .on('presence', { event: 'sync' }, () => {
+      const n = Object.keys(ch.presenceState()).length;
+      count.textContent = n + ' kişi odada';
+    })
+    .subscribe(async status => {
+      if (status === 'SUBSCRIBED') { await ch.track({}); await fetchRow(); }
+    });
+
+  setIdle('Katıldın. Host başlatınca ses herkeste aynı anda çalacak.');
+  setInterval(fetchRow, 10000);                         // kaçan olay olursa yakala
+  setInterval(() => syncClock().catch(() => {}), 120000); // saati ara sıra yeniden eşitle
+});
+
+// ===== Host paneli: sayfa adresinin sonuna ?host ekle =====
+if (new URLSearchParams(location.search).has('host')) {
+  $('host').classList.add('show');
+  const call = async (fn, okMsg) => {
+    const { error } = await db.rpc(fn, { p_password: $('pw').value });
+    $('hostmsg').textContent = error
+      ? (error.message.includes('wrong password') ? 'Şifre yanlış.' : 'Hata: ' + error.message)
+      : okMsg;
+  };
+  $('btnPlay').addEventListener('click', () => call('host_play', 'Başlatıldı. 3 saniye sonra çalacak.'));
+  $('btnStop').addEventListener('click', () => call('host_stop', 'Durduruldu.'));
+}
+</script>
+</body>
+</html>
